@@ -1,0 +1,918 @@
+aiogram>=3.7
+
+"""Telegram-бот: план тренировок верх/низ на 4 дня, расчёт рабочих весов и прогрессия.
+Запуск:  py -m pip install aiogram   затем   py gym_bot.py
+(токен бота можно задать переменной BOT_TOKEN или вставить при запуске)"""
+import asyncio
+import json
+import logging
+import os
+import re
+import sqlite3
+import tempfile
+from datetime import date
+
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.base import BaseStorage
+from aiogram.types import (BotCommand, CallbackQuery, FSInputFile, InlineKeyboardButton,
+                           InlineKeyboardMarkup, KeyboardButton, Message, ReplyKeyboardMarkup)
+
+
+# ======================= ПЛАН И МАТЕМАТИКА =======================
+
+# id: название, коэффициент от массы тела (рабочий вес на ~8 повторов у среднего атлета),
+# шаг прогрессии (кг), заметка
+EX = {
+    "bench":     dict(name="Жим штанги лёжа", k=0.75, inc=2.5, note=""),
+    "row":       dict(name="Тяга штанги в наклоне", k=0.65, inc=2.5, note=""),
+    "ohp":       dict(name="Жим гантелей сидя", k=0.25, inc=2, note="вес одной гантели"),
+    "pulldown":  dict(name="Тяга верхнего блока", k=0.60, inc=2.5, note=""),
+    "lateral":   dict(name="Махи гантелей в стороны", k=0.07, inc=1, note="вес одной гантели"),
+    "pushdown":  dict(name="Разгибание на трицепс (блок)", k=0.35, inc=2.5, note=""),
+    "curl":      dict(name="Сгибание гантелей на наклонной", k=0.12, inc=1, note="вес одной гантели"),
+
+    "squat":     dict(name="Присед со штангой", k=1.00, inc=5, note=""),
+    "rdl":       dict(name="Румынская тяга", k=0.90, inc=5, note=""),
+    "legpress":  dict(name="Жим ногами", k=1.60, inc=5, note=""),
+    "legcurl":   dict(name="Сгибание ног лёжа", k=0.40, inc=2.5, note=""),
+    "calf":      dict(name="Подъём на носки стоя", k=1.00, inc=5, note="тренажёр/Смит"),
+    "crunch":    dict(name="Скручивания на блоке", k=0.40, inc=2.5, note=""),
+
+    "incline":   dict(name="Жим гантелей на наклонной", k=0.30, inc=2, note="вес одной гантели"),
+    "sitrow":    dict(name="Тяга горизонтального блока", k=0.60, inc=2.5, note=""),
+    "pullup":    dict(name="Подтягивания", k=0.0, inc=1, note="доп. вес, 0 = своё тело"),
+    "fly":       dict(name="Сведение рук в кроссовере", k=0.10, inc=1, note="вес одной рукоятки"),
+    "lateral_c": dict(name="Махи в сторону на блоке", k=0.06, inc=1, note="одной рукой"),
+    "ohtri":     dict(name="Французский жим на блоке", k=0.30, inc=2.5, note=""),
+    "hammer":    dict(name="Молотки с гантелями", k=0.15, inc=1, note="вес одной гантели"),
+
+    "deadlift":  dict(name="Становая тяга", k=1.20, inc=5, note=""),
+    "hack":      dict(name="Гакк-присед", k=1.00, inc=5, note=""),
+    "hipthrust": dict(name="Ягодичный мостик со штангой", k=1.00, inc=5, note=""),
+    "legext":    dict(name="Разгибание ног", k=0.50, inc=2.5, note=""),
+    "seatcurl":  dict(name="Сгибание ног сидя", k=0.40, inc=2.5, note=""),
+    "seatcalf":  dict(name="Подъём на носки сидя", k=0.60, inc=2.5, note=""),
+    "reardelt":  dict(name="Разведение в тренажёре (задняя дельта)", k=0.25, inc=2.5, note=""),
+    "skull":     dict(name="Французский жим лёжа (EZ-гриф)", k=0.30, inc=2.5, note=""),
+    "lateral_m": dict(name="Махи в тренажёре (средняя дельта)", k=0.35, inc=2.5, note=""),
+    "cablecurl": dict(name="Сгибание рук на нижнем блоке", k=0.30, inc=2.5, note=""),
+    "ropepd":    dict(name="Разгибание с канатом", k=0.30, inc=2.5, note=""),
+    "arnold":    dict(name="Жим Арнольда", k=0.18, inc=2, note="вес одной гантели"),
+    "ezcurl":    dict(name="Сгибание EZ-штанги стоя", k=0.30, inc=2.5, note=""),
+    "facepull":  dict(name="Тяга каната к лицу", k=0.25, inc=2.5, note=""),
+    "preacher":  dict(name="Сгибание на скамье Скотта", k=0.28, inc=2.5, note=""),
+    "dipsm":     dict(name="Отжимания на брусьях", k=0.0, inc=1, note="доп. вес, 0 = своё тело"),
+}
+
+# (id, подходов, повторы от, повторы до, отдых)
+DAYS = [
+    dict(title="День 1 · Верх A (силовой)", ex=[
+        ("bench", 4, 5, 8, "2–3 мин"), ("row", 4, 6, 8, "2–3 мин"),
+        ("ohp", 3, 8, 10, "2 мин"), ("pulldown", 3, 8, 12, "2 мин"),
+        ("lateral", 3, 12, 20, "1–1,5 мин"), ("reardelt", 3, 12, 20, "1–1,5 мин"),
+        ("skull", 3, 8, 12, "1,5–2 мин"), ("pushdown", 3, 10, 12, "1,5 мин"),
+        ("curl", 3, 10, 12, "1,5 мин")]),
+    dict(title="День 2 · Низ A (квадрицепс + руки/плечи)", ex=[
+        ("squat", 4, 5, 8, "3 мин"), ("rdl", 3, 8, 10, "2–3 мин"),
+        ("legpress", 3, 10, 12, "2 мин"), ("legcurl", 3, 10, 12, "1,5–2 мин"),
+        ("calf", 4, 8, 12, "1,5 мин"), ("lateral_m", 3, 15, 20, "1 мин"),
+        ("cablecurl", 3, 10, 15, "1–1,5 мин"), ("ropepd", 3, 12, 15, "1–1,5 мин"),
+        ("crunch", 3, 10, 15, "1,5 мин")]),
+    dict(title="День 3 · Верх B (объёмный)", ex=[
+        ("incline", 4, 8, 12, "2 мин"), ("sitrow", 4, 8, 12, "2 мин"),
+        ("pullup", 3, 6, 10, "2 мин"), ("arnold", 3, 8, 12, "2 мин"),
+        ("fly", 3, 12, 15, "1,5 мин"), ("lateral_c", 4, 12, 20, "1 мин"),
+        ("ohtri", 3, 10, 15, "1,5 мин"), ("hammer", 3, 10, 12, "1,5 мин"),
+        ("ezcurl", 2, 8, 10, "1,5 мин")]),
+    dict(title="День 4 · Низ B (ягодицы/задняя поверхность + руки/плечи)", ex=[
+        ("deadlift", 3, 4, 6, "3 мин"), ("hack", 3, 8, 10, "2–3 мин"),
+        ("hipthrust", 3, 8, 12, "2 мин"), ("legext", 3, 12, 15, "1,5 мин"),
+        ("seatcurl", 3, 10, 15, "1,5 мин"), ("seatcalf", 4, 12, 15, "1,5 мин"),
+        ("facepull", 3, 12, 20, "1 мин"), ("preacher", 3, 10, 12, "1,5 мин"),
+        ("dipsm", 3, 8, 12, "2 мин")]),
+]
+
+
+def fmt(w: float) -> str:
+    return f"{w:g}"
+
+
+def round_to(x: float, step: float) -> float:
+    return round(round(x / step) * step, 2)
+
+
+def start_weight(ex: str, bodyweight: float, level_k: float) -> float:
+    e = EX[ex]
+    return max(0.0, round_to(bodyweight * e["k"] * level_k, e["inc"]))
+
+
+def one_rm(weight: float, reps: int) -> float:
+    """Формула Эпли."""
+    return weight * (1 + reps / 30) if reps > 1 else weight
+
+
+def working_weight(rm: float, reps: int, rir: int = 2) -> float:
+    """Вес для подхода на `reps` повторов с запасом `rir` повторов."""
+    return rm / (1 + (reps + rir) / 30)
+
+
+def progress(w, fails, reps, sets, lo, hi, inc):
+    """Двойная прогрессия. Возвращает (новый вес, счётчик провалов, сообщение)."""
+    full = len(reps) >= sets
+    if full and min(reps) >= hi:
+        nw = w + inc
+        return nw, 0, f"✅ Во всех подходах верх диапазона → в следующий раз {fmt(nw)} кг"
+    if (not full) or min(reps) < lo:
+        fails += 1
+        if fails >= 2:
+            nw = max(0.0, round_to(w * 0.9, inc))
+            return nw, 0, f"🔻 Два провала подряд → откат до {fmt(nw)} кг (−10%), наберём заново"
+        return w, fails, "⚠️ Не добрал нижнюю границу повторов. Вес оставляем; повторится — откат −10%"
+    return w, 0, f"👍 Вес {fmt(w)} кг держим. Цель — добрать до {hi} повторов во всех подходах"
+
+
+# id -> (подходов, повторы от, повторы до)
+RANGE = {ex: (s, lo, hi) for d in DAYS for ex, s, lo, hi, _ in d["ex"]}
+
+
+def calibrated_weight(ex: str, w: float, reps: int) -> float:
+    """Рабочий вес из твоего лучшего подхода (вес × повторы, близко к отказу).
+    Берём вес на (низ диапазона + 1) повтор с запасом 2 повтора."""
+    e = EX[ex]
+    if e["k"] == 0:  # свой вес: берём введённый доп. вес как есть
+        return max(0.0, w)
+    _, lo, hi = RANGE[ex]
+    return max(0.0, round_to(working_weight(one_rm(w, reps), min(lo + 1, hi)), e["inc"]))
+
+
+# ======================= БОТ =======================
+
+DB_PATH = os.environ.get("DB_PATH", "gym.db")
+os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)
+DB = sqlite3.connect(DB_PATH)
+DB.executescript("""
+CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, bw REAL, sessions INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS weights(uid INTEGER, ex TEXT, w REAL, fails INTEGER DEFAULT 0,
+                                   PRIMARY KEY(uid, ex));
+CREATE TABLE IF NOT EXISTS logs(id INTEGER PRIMARY KEY AUTOINCREMENT, uid INTEGER, d TEXT,
+                                ex TEXT, w REAL, reps TEXT);
+CREATE TABLE IF NOT EXISTS fsm(k TEXT PRIMARY KEY, state TEXT, data TEXT);
+""")
+try:
+    DB.execute("ALTER TABLE weights ADD COLUMN cal INTEGER DEFAULT 0")
+except sqlite3.OperationalError:
+    pass
+
+
+class SQLiteStorage(BaseStorage):
+    """Состояние диалога хранится в gym.db: тренировка не теряется при перезапуске бота."""
+
+    @staticmethod
+    def _k(key):
+        return f"{key.chat_id}:{key.user_id}"
+
+    async def set_state(self, key, state=None):
+        st = state.state if isinstance(state, State) else state
+        DB.execute("INSERT INTO fsm(k,state) VALUES(?,?) "
+                   "ON CONFLICT(k) DO UPDATE SET state=excluded.state", (self._k(key), st))
+        DB.commit()
+
+    async def get_state(self, key):
+        r = DB.execute("SELECT state FROM fsm WHERE k=?", (self._k(key),)).fetchone()
+        return r[0] if r else None
+
+    async def set_data(self, key, data):
+        DB.execute("INSERT INTO fsm(k,data) VALUES(?,?) "
+                   "ON CONFLICT(k) DO UPDATE SET data=excluded.data",
+                   (self._k(key), json.dumps(data, ensure_ascii=False)))
+        DB.commit()
+
+    async def get_data(self, key):
+        r = DB.execute("SELECT data FROM fsm WHERE k=?", (self._k(key),)).fetchone()
+        return json.loads(r[0]) if r and r[0] else {}
+
+    async def close(self):
+        pass
+
+
+router = Router()
+MENU = ReplyKeyboardMarkup(resize_keyboard=True, is_persistent=True, keyboard=[
+    [KeyboardButton(text="🏋️ Тренировка"), KeyboardButton(text="📋 План")],
+    [KeyboardButton(text="📈 Прогресс"), KeyboardButton(text="🧮 Калькулятор")],
+    [KeyboardButton(text="❓ Помощь")]])
+MENU_WORDS = {"тренировка", "план", "прогресс", "калькулятор", "помощь"}
+
+
+def menu_key(text):
+    """Какая кнопка меню нажата (эмодзи и невидимые символы игнорируем)."""
+    t = (text or "").replace("\ufe0f", "").strip().lower()
+    t = re.sub(r"^[^\w]+", "", t)
+    return t if t in MENU_WORDS else None
+
+
+class Onb(StatesGroup):
+    bw = State()
+    key = State()
+
+
+class Wk(StatesGroup):
+    cal = State()     # ждём вес нового упражнения
+    run = State()     # идут подходы (кнопки с повторами)
+    weight = State()  # ждём новый вес текстом
+
+
+class Calc(StatesGroup):
+    wait = State()
+
+
+# ---------- БД ----------
+def get_user(uid):
+    return DB.execute("SELECT bw, sessions FROM users WHERE id=?", (uid,)).fetchone()
+
+
+def set_w(uid, ex, w, fails=0, cal=None):
+    """cal: 1 — вес подтверждён пользователем, 0 — оценка, None — не менять."""
+    DB.execute("INSERT INTO weights(uid,ex,w,fails,cal) VALUES(?,?,?,?,COALESCE(?,0)) "
+               "ON CONFLICT(uid,ex) DO UPDATE SET w=excluded.w, fails=excluded.fails, "
+               "cal=COALESCE(?, cal)", (uid, ex, w, fails, cal, cal))
+    DB.commit()
+
+
+def get_w(uid, ex):
+    r = DB.execute("SELECT w, fails FROM weights WHERE uid=? AND ex=?", (uid, ex)).fetchone()
+    if r is None:  # новое упражнение у существующего пользователя: оценка, потом уточним
+        u = DB.execute("SELECT bw FROM users WHERE id=?", (uid,)).fetchone()
+        w = start_weight(ex, u[0] if u else 75, 0.85)
+        set_w(uid, ex, w, 0, 0)
+        return (w, 0)
+    return r
+
+
+def get_cal(uid, ex):
+    r = DB.execute("SELECT cal FROM weights WHERE uid=? AND ex=?", (uid, ex)).fetchone()
+    return bool(r and r[0])
+
+
+def phase(sessions):
+    """день цикла (0..3), номер недели, разгрузочная ли неделя (каждая 6-я)."""
+    week = sessions // 4 + 1
+    return sessions % 4, week, week % 6 == 0
+
+
+# ---------- вспомогательное ----------
+def kb(*rows):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=t, callback_data=cd) for t, cd in row] for row in rows])
+
+
+async def send(msg, text, markup=None, edit=False):
+    if edit:
+        try:
+            return await msg.edit_text(text, reply_markup=markup)
+        except Exception:
+            pass
+    return await msg.answer(text, reply_markup=markup)
+
+
+def parse_input(txt):
+    """'60' -> (60.0, None); '60 10' / '60x10' -> (60.0, 10)."""
+    t = (txt or "").strip().lower().replace(",", ".")
+    mt = re.match(r"^(\d+(?:\.\d+)?)(?:\s*[x×*\s]\s*(\d{1,2}))?$", t)
+    if not mt:
+        return None
+    return float(mt.group(1)), (int(mt.group(2)) if mt.group(2) else None)
+
+
+def to_working(ex, w, r):
+    """Вес + повторы лучшего подхода -> рабочий вес; один вес -> берём как есть."""
+    return calibrated_weight(ex, w, r) if r else w
+
+
+def wlabel(ex, w):
+    if EX[ex]["k"] == 0:
+        return "своё тело" if w == 0 else f"+{fmt(w)} кг"
+    return f"{fmt(w)} кг"
+
+
+def name_note(ex):
+    e = EX[ex]
+    return e["name"] + (f" ({e['note']})" if e["note"] else "")
+
+
+def last_result(uid, ex):
+    r = DB.execute("SELECT w, reps FROM logs WHERE uid=? AND ex=? ORDER BY id DESC LIMIT 1",
+                   (uid, ex)).fetchone()
+    return f"Прошлый раз: {wlabel(ex, r[0])} × {r[1]}" if r else ""
+
+
+HELP = ("<b>Как пользоваться</b>\n\n"
+        "1. «🏋️ Тренировка» → «▶️ Начать».\n"
+        "2. Бот показывает упражнение, вес и число подходов. После каждого подхода "
+        "нажимай число сделанных повторов.\n"
+        "3. Вес не подходит? «⚖️ Изменить вес». Нажал не то? «↩️ Отменить подход».\n"
+        "4. После упражнения жми «➡️ Дальше».\n"
+        "5. Тренировку можно прервать и вернуться: нажми «🏋️ Тренировка» → «Продолжить».\n\n"
+        "<b>Как растут веса:</b> если во всех подходах сделал верх диапазона (например 8 из 5–8), "
+        "в следующий раз вес вырастет. Не добрал низ два раза подряд — вес снизится на 10%.\n\n"
+        "<b>Команды:</b> /stop — прервать тренировку, /setweight bench 85 — задать вес, "
+        "/recalib — заново уточнить веса, /calc 80 8 — калькулятор.")
+
+
+# =====================================================================
+# 1. МЕНЮ — обрабатывается раньше всего и работает из любого состояния
+# =====================================================================
+@router.message(F.text.func(lambda t: menu_key(t) is not None))
+async def on_menu(m: Message, state: FSMContext):
+    key = menu_key(m.text)
+    if key == "помощь":
+        return await m.answer(HELP, reply_markup=MENU)
+    if key == "план":
+        return await show_plan(m)
+    if key == "прогресс":
+        return await stats(m)
+    if key == "калькулятор":
+        return await calc_start(m, state)
+    await workout(m, state)
+
+
+# =====================================================================
+# 2. КОМАНДЫ
+# =====================================================================
+INTRO = ("👋 <b>Бот-тренер: верх/низ на 4 дня</b>\n\n"
+         "• Каждая мышца работает 2 раза в неделю\n"
+         "• Ты нажимаешь, сколько повторов сделал, — бот сам считает, когда поднимать вес\n"
+         "• Каждая 6-я неделя — разгрузка\n\n"
+         "Сначала быстрая настройка (1–2 минуты). <b>Твой уровень?</b>")
+KEY = ["bench", "squat", "deadlift", "row", "ohp", "pulldown"]
+SKIP_KB = kb([("🤷 Не знаю / пропустить", "ksk")])
+
+
+@router.message(CommandStart())
+async def start(m: Message, state: FSMContext):
+    if get_user(m.from_user.id):
+        return await m.answer("С возвращением! Меню обновлено 👇\nНажми «🏋️ Тренировка».",
+                              reply_markup=MENU)
+    await state.clear()
+    await m.answer(INTRO, reply_markup=kb([("🌱 Новичок (до года)", "lvl:0.7")],
+                                          [("💪 Средний (1+ год)", "lvl:1.0")]))
+
+
+@router.message(Command("help"))
+async def help_cmd(m: Message):
+    await m.answer(HELP, reply_markup=MENU)
+
+
+@router.message(Command("workout"))
+async def workout_cmd(m: Message, state: FSMContext):
+    await workout(m, state)
+
+
+@router.message(Command("stop"))
+async def stop(m: Message, state: FSMContext):
+    await state.clear()
+    await m.answer("Тренировка прервана (в счётчик не идёт).", reply_markup=MENU)
+
+
+@router.message(Command("calc"))
+async def calc_cmd(m: Message):
+    wr = parse_input((m.text or "").replace("/calc", "", 1))
+    if not wr or not wr[1] or wr[0] <= 0:
+        return await m.answer("Формат: <code>/calc 80 8</code> (вес и повторы)")
+    await calc_answer(m, *wr)
+
+
+@router.message(Command("setweight"))
+async def setweight(m: Message):
+    try:
+        _, ex, w = m.text.split()
+        assert ex in EX
+        set_w(m.from_user.id, ex, float(w.replace(",", ".")), 0, 1)
+        await m.answer(f"{EX[ex]['name']}: {w} кг ✅")
+    except Exception:
+        await m.answer("Формат: <code>/setweight bench 85</code>. Названия: "
+                       + ", ".join(f"<code>{k}</code>" for k in EX))
+
+
+@router.message(Command("recalib"))
+async def recalib(m: Message):
+    DB.execute("UPDATE weights SET cal=0 WHERE uid=?", (m.from_user.id,))
+    DB.commit()
+    await m.answer("Ок, перед каждым упражнением снова уточню твой вес.")
+
+
+# =====================================================================
+# 3. РЕГИСТРАЦИЯ
+# =====================================================================
+@router.callback_query(F.data.startswith("lvl:"))
+async def level(c: CallbackQuery, state: FSMContext):
+    await state.set_state(Onb.bw)
+    await state.set_data({"k": float(c.data[4:])})
+    await c.message.answer("<b>Шаг 1.</b> Напиши свою массу тела в кг, например <code>78</code>")
+    await c.answer()
+
+
+@router.message(Onb.bw)
+async def bodyweight(m: Message, state: FSMContext):
+    try:
+        bw = float((m.text or "").replace(",", "."))
+        assert 30 <= bw <= 250
+    except Exception:
+        return await m.answer("Напиши число, например <code>78</code>")
+    k = (await state.get_data())["k"]
+    uid = m.from_user.id
+    DB.execute("INSERT OR REPLACE INTO users VALUES(?,?,0)", (uid, bw))
+    for ex in EX:
+        set_w(uid, ex, start_weight(ex, bw, k), 0, 0)  # запасная оценка
+    await state.set_state(Onb.key)
+    await state.set_data(dict(k=k, bw=bw, i=0, ratios=[]))
+    await m.answer("<b>Шаг 2.</b> Теперь твои веса в 6 базовых упражнениях. По ним я прикину "
+                   "остальные, а новые упражнения уточню прямо в тренировке.")
+    await m.answer(key_prompt(0), reply_markup=SKIP_KB)
+
+
+def key_prompt(i):
+    return (f"<b>Вопрос {i + 1} из {len(KEY)} · {name_note(KEY[i])}</b>\n"
+            "Напиши вес и повторы твоего лучшего недавнего подхода (до отказа или близко).\n"
+            "Пример: <code>80 8</code> — это 80 кг на 8 повторов.\n"
+            "Если не делаешь это упражнение — нажми кнопку ниже.")
+
+
+async def key_step(msg, state, uid, wr):
+    d = await state.get_data()
+    i, ratios, ex = d["i"], d["ratios"], KEY[d["i"]]
+    if wr:
+        w = to_working(ex, *wr)
+        set_w(uid, ex, w, 0, 1)
+        if EX[ex]["k"] > 0 and w > 0:
+            ratios.append(w / (d["bw"] * EX[ex]["k"]))
+    i += 1
+    if i < len(KEY):
+        await state.update_data(i=i, ratios=ratios)
+        return await msg.answer(key_prompt(i), reply_markup=SKIP_KB)
+    ratio = sum(ratios) / len(ratios) if ratios else d["k"]
+    for e in EX:  # остальные упражнения — по массе тела × твой коэффициент силы
+        if not get_cal(uid, e):
+            set_w(uid, e, max(0.0, round_to(d["bw"] * EX[e]["k"] * ratio, EX[e]["inc"])), 0, 0)
+    await state.clear()
+    await msg.answer("✅ <b>Готово!</b> Рабочие веса рассчитаны.\n\n"
+                     "Нажми «🏋️ Тренировка» внизу, чтобы начать. Перед упражнениями делай 2–3 "
+                     "разминочных подхода с лёгким весом.", reply_markup=MENU)
+
+
+@router.message(Onb.key)
+async def onb_key(m: Message, state: FSMContext):
+    wr = parse_input(m.text)
+    if not wr:
+        return await m.answer("Формат: <code>80 8</code> (вес и повторы) или нажми «Не знаю».",
+                              reply_markup=SKIP_KB)
+    await key_step(m, state, m.from_user.id, wr)
+
+
+@router.callback_query(Onb.key, F.data == "ksk")
+async def onb_skip(c: CallbackQuery, state: FSMContext):
+    await c.answer()
+    await key_step(c.message, state, c.from_user.id, None)
+
+
+# =====================================================================
+# 4. ПЛАН, ПРОГРЕСС, КАЛЬКУЛЯТОР
+# =====================================================================
+def day_text(i):
+    lines = [f"<b>{DAYS[i]['title']}</b>"]
+    for n, (ex, sets, lo, hi, rest) in enumerate(DAYS[i]["ex"], 1):
+        lines.append(f"{n}. {EX[ex]['name']} — {sets}×{lo}–{hi}")
+    return "\n".join(lines)
+
+
+def plan_kb():
+    return kb([(f"День {i + 1}", f"pd:{i}") for i in range(4)])
+
+
+async def show_plan(m):
+    await m.answer("<b>Расписание:</b> Пн — День 1, Вт — День 2, Чт — День 3, Пт — День 4. "
+                   "Среда и выходные — отдых.\n\nВыбери день, чтобы посмотреть упражнения 👇",
+                   reply_markup=plan_kb())
+
+
+@router.callback_query(F.data.startswith("pd:"))
+async def plan_day(c: CallbackQuery):
+    await c.answer()
+    await send(c.message, day_text(int(c.data[3:])), plan_kb(), edit=True)
+
+
+async def stats(m):
+    uid = m.from_user.id
+    u = get_user(uid)
+    if not u:
+        return await m.answer("Сначала нажми /start")
+    day, week, deload = phase(u[1])
+    lines = [f"Тренировок: <b>{u[1]}</b> · неделя {week} · дальше: {DAYS[day]['title']}",
+             "", "<b>Рабочие веса</b> (≈ — оценка, уточнится перед первым подходом):"]
+    for ex, e in EX.items():
+        w, _ = get_w(uid, ex)
+        mark = "" if get_cal(uid, ex) else " ≈"
+        lines.append(f"{e['name']}: <b>{wlabel(ex, w)}</b>{mark}")
+    main = []
+    for ex in ("bench", "squat", "deadlift", "row"):
+        r = DB.execute("SELECT w, reps FROM logs WHERE uid=? AND ex=? ORDER BY id DESC LIMIT 1",
+                       (uid, ex)).fetchone()
+        if r and r[1].split():
+            top = int(max(r[1].split(), key=int))
+            main.append(f"{EX[ex]['name']}: ~{one_rm(r[0], top):.0f} кг")
+    if main:
+        lines += ["", "<b>Оценка 1ПМ по последним подходам:</b>"] + main
+    await m.answer("\n".join(lines))
+
+
+async def calc_answer(m, w, r):
+    rm = one_rm(w, r)
+    rows = [f"{reps} повторов → <b>{fmt(round_to(working_weight(rm, reps), 2.5))} кг</b>"
+            for reps in (5, 6, 8, 10, 12, 15)]
+    await m.answer(f"Оценка 1ПМ: <b>{rm:.1f} кг</b>\nРабочие веса (запас 2 повтора):\n" + "\n".join(rows))
+
+
+async def calc_start(m, state):
+    if await state.get_state() not in (None, Calc.wait.state):
+        return await m.answer("Сейчас идёт тренировка/настройка. Калькулятор работает командой: "
+                              "<code>/calc 80 8</code> (вес и повторы).")
+    await state.set_state(Calc.wait)
+    await m.answer("Напиши вес и повторы лучшего подхода, например <code>80 8</code> — "
+                   "посчитаю 1ПМ и рабочие веса.")
+
+
+@router.message(Calc.wait)
+async def calc_input(m: Message, state: FSMContext):
+    wr = parse_input(m.text)
+    if not wr or not wr[1] or wr[0] <= 0:
+        return await m.answer("Формат: <code>80 8</code> (вес и повторы)")
+    await state.set_state(None)
+    await calc_answer(m, *wr)
+
+
+# =====================================================================
+# 5. ТРЕНИРОВКА
+# =====================================================================
+def ex_info(d):
+    return DAYS[d["day"]]["ex"][d["i"]]
+
+
+def n_ex(d):
+    return len(DAYS[d["day"]]["ex"])
+
+
+def target(uid, ex, sets, deload):
+    w, _ = get_w(uid, ex)
+    if deload:
+        w, sets = round_to(w * 0.9, EX[ex]["inc"]), max(2, sets - 1)
+    return w, sets
+
+
+def set_screen(d, prefix=""):
+    ex, sets, lo, hi, rest = ex_info(d)
+    done = "".join(f"✔ Подход {k + 1}: {wlabel(ex, w)} × {r}\n" for k, (w, r) in enumerate(d["sets"]))
+    text = (f"{prefix}<b>{d['i'] + 1}/{n_ex(d)} · {name_note(ex)}</b>\n"
+            f"План: {d['n']} × {lo}–{hi} повторов · отдых {rest}\n")
+    if d["s"] == 0:
+        prev = last_result(d["uid"], ex)
+        text += (prev + "\n" if prev else "")
+    text += (f"\n{done}\n👉 <b>Подход {d['s'] + 1} из {d['n']}</b> — вес <b>{wlabel(ex, d['w'])}</b>\n"
+             "Сколько повторов сделал? Нажми число")
+    if d["s"] == 0:
+        text += "\n💡 Оставляй в запасе 1–2 повтора."
+    a = max(1, lo - 2)
+    nums = list(range(a, min(hi + 2, a + 11) + 1))
+    rows = [[(str(n), f"r:{n}") for n in nums[k:k + 4]] for k in range(0, len(nums), 4)]
+    rows.append([("⚖️ Изменить вес", "wt"), ("⏭ Пропустить упр.", "skip")])
+    if d["s"] > 0:
+        rows.append([("↩️ Отменить последний подход", "undo")])
+    return text, kb(*rows)
+
+
+def next_kb(d):
+    last = d["i"] + 1 >= n_ex(d)
+    return kb([("🏁 Завершить тренировку" if last else "➡️ Дальше", "next")])
+
+
+async def begin_exercise(msg, state, uid, d, edit=False, prefix=""):
+    ex, sets, lo, hi, rest = ex_info(d)
+    if not get_cal(uid, ex):
+        w = get_w(uid, ex)[0]
+        d["stage"] = "cal"
+        await state.set_state(Wk.cal)
+        await state.set_data(d)
+        how = ("Напиши доп. вес в кг (<code>0</code> — без веса)."
+               if EX[ex]["k"] == 0 else
+               "• нажми «Взять» ИЛИ напиши свой рабочий вес: <code>60</code>\n"
+               "• либо лучший подход: <code>60 10</code> (60 кг × 10) — тогда я рассчитаю вес сам")
+        text = (f"{prefix}<b>{d['i'] + 1}/{n_ex(d)} · {name_note(ex)}</b>\n"
+                "Первый раз в этом упражнении — определим рабочий вес.\n\n"
+                f"Предлагаю: <b>{wlabel(ex, w)}</b>\n\n{how}")
+        return await send(msg, text, kb([(f"✅ Взять {wlabel(ex, w)}", "calok")],
+                                        [("⏭ Пропустить упражнение", "skip")]), edit)
+    w, n = target(uid, ex, sets, d["deload"])
+    d.update(stage="set", w=w, n=n, s=0, sets=[])
+    await state.set_state(Wk.run)
+    await state.set_data(d)
+    text, markup = set_screen(d, prefix)
+    await send(msg, text, markup, edit)
+
+
+async def go_next(msg, state, uid, d, edit=False, prefix=""):
+    if d["i"] + 1 >= n_ex(d):
+        DB.execute("UPDATE users SET sessions = sessions + 1 WHERE id=?", (uid,))
+        DB.commit()
+        await state.clear()
+        try:
+            await msg.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return await msg.answer(
+            prefix + "🔥 <b>Тренировка завершена!</b>\n\n" + "\n".join(d["summary"]) +
+            "\n\nОтдыхай, ешь белок (~1,6–2 г на кг массы тела) и хорошо спи. "
+            "Следующая тренировка — кнопка «🏋️ Тренировка».", reply_markup=MENU)
+    d["i"] += 1
+    await begin_exercise(msg, state, uid, d, edit, prefix)
+
+
+async def start_workout(msg, state, uid):
+    day, week, deload = phase(get_user(uid)[1])
+    d = dict(day=day, i=0, deload=deload, summary=[], stage="start", uid=uid)
+    await state.set_state(Wk.run)
+    await state.set_data(d)
+    note = "\n🧘 <b>Неделя разгрузки:</b> веса −10%, на 1 подход меньше.\n" if deload else ""
+    await msg.answer(f"<b>{DAYS[day]['title']}</b> · неделя {week}\n{note}\n{day_text(day)}\n\n"
+                     f"Всего {sum(e[1] for e in DAYS[day]['ex'])} подходов, примерно 75–90 минут. Готов?",
+                     reply_markup=kb([("▶️ Начать", "go")], [("❌ Отмена", "cancel")]))
+
+
+async def workout(m, state):
+    uid = m.from_user.id
+    if not get_user(uid):
+        return await m.answer("Сначала нажми /start")
+    d = await state.get_data()
+    if d.get("stage") in ("set", "cal", "done") and "day" in d:
+        return await m.answer(
+            f"У тебя есть незавершённая тренировка: <b>{DAYS[d['day']]['title']}</b>, "
+            f"упражнение {d['i'] + 1} из {n_ex(d)}.",
+            reply_markup=kb([("▶️ Продолжить", "resume")], [("🔄 Начать заново", "restart")],
+                            [("🗑 Отменить", "cancel")]))
+    await start_workout(m, state, uid)
+
+
+async def get_session(c, state, *stages):
+    d = await state.get_data()
+    if not d or d.get("stage") not in stages:
+        await c.answer("Это сообщение устарело. Нажми «🏋️ Тренировка» внизу.", show_alert=True)
+        return None
+    await c.answer()
+    return d
+
+
+@router.callback_query(F.data == "cancel")
+async def cancel(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await c.answer()
+    await send(c.message, "Тренировка отменена.", None, edit=True)
+
+
+@router.callback_query(F.data == "restart")
+async def restart(c: CallbackQuery, state: FSMContext):
+    await c.answer()
+    await send(c.message, "Начинаем заново 👇", None, edit=True)
+    await start_workout(c.message, state, c.from_user.id)
+
+
+@router.callback_query(F.data == "resume")
+async def resume(c: CallbackQuery, state: FSMContext):
+    d = await get_session(c, state, "set", "cal", "done")
+    if not d:
+        return
+    uid = c.from_user.id
+    if d["stage"] == "set":
+        await state.set_state(Wk.run)
+        text, markup = set_screen(d)
+        await c.message.answer(text, reply_markup=markup)
+    elif d["stage"] == "cal":
+        await begin_exercise(c.message, state, uid, d)
+    else:
+        await state.set_state(Wk.run)
+        await c.message.answer(d.get("done_text", "Упражнение готово."), reply_markup=next_kb(d))
+    try:
+        await c.message.delete()
+    except Exception:
+        pass
+
+
+@router.callback_query(F.data == "go")
+async def go(c: CallbackQuery, state: FSMContext):
+    d = await get_session(c, state, "start")
+    if d:
+        await begin_exercise(c.message, state, c.from_user.id, d, edit=True)
+
+
+# ----- калибровка веса нового упражнения -----
+@router.callback_query(F.data == "calok")
+async def cal_ok(c: CallbackQuery, state: FSMContext):
+    d = await get_session(c, state, "cal")
+    if d:
+        uid, ex = c.from_user.id, ex_info(d)[0]
+        set_w(uid, ex, get_w(uid, ex)[0], 0, 1)
+        await begin_exercise(c.message, state, uid, d, edit=True)
+
+
+@router.message(Wk.cal)
+async def cal_text(m: Message, state: FSMContext):
+    d = await state.get_data()
+    wr = parse_input(m.text)
+    if not d or "day" not in d or not wr:
+        return await m.answer("Напиши вес числом, например <code>60</code>, "
+                              "или вес и повторы: <code>60 10</code>")
+    uid, ex = m.from_user.id, ex_info(d)[0]
+    w = to_working(ex, *wr)
+    set_w(uid, ex, w, 0, 1)
+    await begin_exercise(m, state, uid, d, prefix=f"✅ Рабочий вес: <b>{wlabel(ex, w)}</b>\n\n")
+
+
+# ----- подходы -----
+async def record(msg, state, uid, d, n, edit):
+    ex, sets, lo, hi, rest = ex_info(d)
+    d["sets"].append([d["w"], n])
+    d["s"] += 1
+    if d["s"] < d["n"]:
+        await state.set_state(Wk.run)
+        await state.set_data(d)
+        text, markup = set_screen(d)
+        return await send(msg, text, markup, edit)
+    reps = [r for _, r in d["sets"]]
+    w = d["w"]
+    DB.execute("INSERT INTO logs(uid,d,ex,w,reps) VALUES(?,?,?,?,?)",
+               (uid, date.today().isoformat(), ex, w, " ".join(map(str, reps))))
+    DB.commit()
+    if d["deload"]:
+        note = "🧘 Разгрузка — вес не меняем."
+    else:
+        _, fails = get_w(uid, ex)
+        nw, nf, note = progress(w, fails, reps, sets, lo, hi, EX[ex]["inc"])
+        set_w(uid, ex, nw, nf)
+    d["summary"].append(f"• {EX[ex]['name']}: {wlabel(ex, w)} × {' '.join(map(str, reps))}")
+    d["stage"] = "done"
+    text = f"✅ <b>{EX[ex]['name']}</b> — готово!\n{wlabel(ex, w)} × {' '.join(map(str, reps))}\n\n{note}"
+    if d["i"] + 1 < n_ex(d):
+        text += f"\n\nДальше: {EX[DAYS[d['day']]['ex'][d['i'] + 1][0]]['name']}"
+    d["done_text"] = text
+    await state.set_state(Wk.run)
+    await state.set_data(d)
+    await send(msg, text, next_kb(d), edit)
+
+
+@router.callback_query(F.data.startswith("r:"))
+async def reps_button(c: CallbackQuery, state: FSMContext):
+    d = await get_session(c, state, "set")
+    if d:
+        await record(c.message, state, c.from_user.id, d, int(c.data[2:]), edit=True)
+
+
+@router.callback_query(F.data == "undo")
+async def undo_button(c: CallbackQuery, state: FSMContext):
+    d = await get_session(c, state, "set")
+    if d and d["sets"]:
+        d["sets"].pop()
+        d["s"] -= 1
+        await state.set_state(Wk.run)
+        await state.set_data(d)
+        text, markup = set_screen(d)
+        await send(c.message, text, markup, edit=True)
+
+
+@router.callback_query(F.data == "next")
+async def next_button(c: CallbackQuery, state: FSMContext):
+    d = await get_session(c, state, "done")
+    if d:
+        await go_next(c.message, state, c.from_user.id, d, edit=True)
+
+
+@router.callback_query(F.data == "skip")
+async def skip_button(c: CallbackQuery, state: FSMContext):
+    d = await get_session(c, state, "set", "cal")
+    if d:
+        d["summary"].append(f"• {EX[ex_info(d)[0]]['name']}: пропущено")
+        await go_next(c.message, state, c.from_user.id, d, edit=True)
+
+
+@router.callback_query(F.data == "wt")
+async def weight_button(c: CallbackQuery, state: FSMContext):
+    d = await get_session(c, state, "set")
+    if d:
+        await state.set_state(Wk.weight)
+        await c.message.answer("⚖️ Напиши новый вес в кг, например <code>82.5</code>. "
+                               "Он применится к текущему и следующим подходам.")
+
+
+@router.message(Wk.weight)
+async def weight_text(m: Message, state: FSMContext):
+    d = await state.get_data()
+    wr = parse_input(m.text)
+    if not d or d.get("stage") != "set" or not wr or wr[1]:
+        return await m.answer("Напиши только вес числом, например <code>82.5</code>")
+    d["w"] = wr[0]
+    await state.set_state(Wk.run)
+    await state.set_data(d)
+    text, markup = set_screen(d)
+    await m.answer(text, reply_markup=markup)
+
+
+@router.message(Wk.run)
+async def run_text(m: Message, state: FSMContext):
+    d = await state.get_data()
+    t = (m.text or "").strip()
+    if d and d.get("stage") == "set" and t.isdigit() and 0 < int(t) <= 99:
+        return await record(m, state, m.from_user.id, d, int(t), edit=False)
+    await m.answer("Нажми кнопку под упражнением 👆 (или напиши число повторов). "
+                   "Меню внизу работает в любой момент.")
+
+
+# ---------- резервная копия базы (только владелец: переменная ADMIN_ID) ----------
+def is_admin(uid):
+    return bool(os.environ.get("ADMIN_ID")) and str(uid) == os.environ["ADMIN_ID"].strip()
+
+
+@router.message(Command("backup"))
+async def backup(m: Message):
+    if not is_admin(m.from_user.id):
+        return await m.answer("Команда только для владельца бота (нужна переменная ADMIN_ID).")
+    DB.commit()
+    path = os.path.join(tempfile.gettempdir(), "gym_backup.db")
+    dst = sqlite3.connect(path)
+    DB.backup(dst)
+    dst.close()
+    await m.answer_document(FSInputFile(path, filename=f"gym_backup_{date.today()}.db"),
+                            caption="Резервная копия. Чтобы восстановить — отправь этот файл боту "
+                                    "с подписью /restore")
+
+
+@router.message(F.document)
+async def restore(m: Message):
+    if not (m.caption or "").strip().lower().startswith("/restore"):
+        return await m.answer("Чтобы восстановить базу, отправь файл с подписью /restore.")
+    if not is_admin(m.from_user.id):
+        return await m.answer("Восстановление доступно только владельцу бота.")
+    path = os.path.join(tempfile.gettempdir(), "gym_restore.db")
+    try:
+        await m.bot.download(m.document, destination=path)
+        src = sqlite3.connect(path)
+        src.execute("SELECT count(*) FROM users")  # проверка, что это наша база
+        src.backup(DB)
+        src.close()
+    except Exception as e:
+        return await m.answer(f"Не получилось восстановить: {e}")
+    await m.answer("✅ База восстановлена.")
+
+
+# =====================================================================
+# 6. ВСЁ ОСТАЛЬНОЕ (регистрируется последним)
+# =====================================================================
+@router.message()
+async def fallback(m: Message, state: FSMContext):
+    if await state.get_state() is None:
+        wr = parse_input(m.text)
+        if wr and wr[1] and wr[0] > 0:  # "80 8" без команды — считаем как калькулятор
+            return await calc_answer(m, *wr)
+    await m.answer("Выбери действие в меню внизу 👇", reply_markup=MENU)
+
+
+@router.callback_query()
+async def stale_button(c: CallbackQuery):
+    await c.answer("Эта кнопка устарела. Используй меню внизу 👇", show_alert=True)
+
+
+async def main():
+    logging.basicConfig(level=logging.INFO)
+    token = os.environ.get("BOT_TOKEN")
+    if not token:
+        try:
+            token = input("Вставь токен бота от @BotFather: ").strip()
+        except EOFError:
+            token = ""
+    if not token:
+        raise SystemExit("Не задан токен: укажи переменную окружения BOT_TOKEN.")
+    bot = Bot(token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    dp = Dispatcher(storage=SQLiteStorage())
+    dp.include_router(router)
+    await bot.set_my_commands([
+        BotCommand(command="workout", description="Начать/продолжить тренировку"),
+        BotCommand(command="help", description="Как пользоваться"),
+        BotCommand(command="calc", description="Калькулятор весов: /calc 80 8"),
+        BotCommand(command="stop", description="Прервать тренировку"),
+        BotCommand(command="start", description="Обновить меню"),
+        BotCommand(command="backup", description="Резервная копия базы (владелец)")])
+    print("Бот запущен. Не закрывай это окно. Остановить: Ctrl+C")
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
